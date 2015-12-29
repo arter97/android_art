@@ -444,7 +444,7 @@ mirror::ArtMethod* MethodVerifier::FindInvokedMethodAtDexPc(uint32_t dex_pc) {
   }
   const Instruction* inst = Instruction::At(code_item_->insns_ + dex_pc);
   const bool is_range = (inst->Opcode() == Instruction::INVOKE_VIRTUAL_RANGE_QUICK);
-  return GetQuickInvokedMethod(inst, register_line, is_range);
+  return GetQuickInvokedMethod(inst, register_line, is_range, false);
 }
 
 bool MethodVerifier::Verify() {
@@ -3336,20 +3336,23 @@ RegType& MethodVerifier::FallbackToDebugInfo(RegType& type, RegisterLine* reg_li
   struct RegTypeFromDebugInfoContext {
     uint16_t slot;
     uint32_t insn_idx;
-    RegTypeCache* reg_types;
-    Handle<mirror::ClassLoader>* class_loader;
-    RegType* result;
+    std::set<std::string> matches;
+    bool has_exact_match = false;
 
     static void Callback(void* context, uint16_t slot, uint32_t startAddress, uint32_t endAddress,
                          const char* name, const char* descriptor, const char* signature)
         SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
       RegTypeFromDebugInfoContext* pContext = reinterpret_cast<RegTypeFromDebugInfoContext*>(context);
 
-      if (slot != pContext->slot)
+      if (pContext->has_exact_match || slot != pContext->slot)
         return;
 
       if (startAddress <= pContext->insn_idx && pContext->insn_idx < endAddress) {
-        pContext->result = &pContext->reg_types->FromDescriptor(pContext->class_loader->Get(), descriptor, false);
+        pContext->has_exact_match = true;
+        pContext->matches.clear();
+        pContext->matches.insert(descriptor);
+      } else {
+        pContext->matches.insert(descriptor);
       }
     }
   };
@@ -3357,30 +3360,40 @@ RegType& MethodVerifier::FallbackToDebugInfo(RegType& type, RegisterLine* reg_li
   RegTypeFromDebugInfoContext context;
   context.slot = slot;
   context.insn_idx = work_insn_idx_;
-  context.reg_types = &reg_types_;
-  context.class_loader = class_loader_;
-  context.result = nullptr;
   dex_file_->DecodeDebugInfo(code_item_, IsStatic(), dex_method_idx_,
       nullptr, RegTypeFromDebugInfoContext::Callback, &context);
 
   std::string location(StringPrintf("%s: [0x%X] ", PrettyMethod(dex_method_idx_, *dex_file_).c_str(), work_insn_idx_));
-  if (context.result != nullptr) {
-    RegType& actual_type = *context.result;
-    LOG(WARNING) << location << "Using type '" << actual_type << "' from debug information for v" << slot;
+  if (context.matches.size() == 1) {
+    RegType& actual_type = reg_types_.FromDescriptor(class_loader_->Get(), context.matches.begin()->c_str(), false);
+    VLOG(verifier) << location << "Using type '" << actual_type << "' from debug information for v" << slot
+        << (context.has_exact_match ? " (exact match)" : " (no other possiblities)");
     reg_line->SetRegisterType(slot, actual_type);
     return actual_type;
   } else {
     LOG(ERROR) << location << "Could not get type for v" << slot << " from debug information";
+    if (context.matches.empty()) {
+      LOG(ERROR) << "-> No type information found";
+    } else {
+      LOG(ERROR) << "-> Possible types:";
+      for (auto descriptor : context.matches) {
+        LOG(ERROR) << "  - " << descriptor;
+      }
+    }
     return type;
   }
 }
 
 mirror::ArtMethod* MethodVerifier::GetQuickInvokedMethod(const Instruction* inst,
-                                                         RegisterLine* reg_line, bool is_range) {
-  DCHECK(inst->Opcode() == Instruction::INVOKE_VIRTUAL_QUICK ||
-         inst->Opcode() == Instruction::INVOKE_VIRTUAL_RANGE_QUICK);
+                                                         RegisterLine* reg_line, bool is_range,
+                                                         bool allow_failure) {
+  if (is_range) {
+    DCHECK_EQ(inst->Opcode(), Instruction::INVOKE_VIRTUAL_RANGE_QUICK);
+  } else {
+    DCHECK_EQ(inst->Opcode(), Instruction::INVOKE_VIRTUAL_QUICK);
+  }
   uint16_t this_reg = (is_range) ? inst->VRegC_3rc() : inst->VRegC_35c();
-  RegType& actual_arg_type = FallbackToDebugInfo(reg_line->GetInvocationThis(inst, is_range), reg_line, this_reg);
+  RegType& actual_arg_type = FallbackToDebugInfo(reg_line->GetInvocationThis(inst, is_range, allow_failure), reg_line, this_reg);
   if (!actual_arg_type.HasClass()) {
     VLOG(verifier) << "Failed to get mirror::Class* from '" << actual_arg_type << "'";
     return nullptr;
@@ -3391,29 +3404,29 @@ mirror::ArtMethod* MethodVerifier::GetQuickInvokedMethod(const Instruction* inst
     // Derive Object.class from Class.class.getSuperclass().
     mirror::Class* object_klass = klass->GetClass()->GetSuperClass();
     if (FailOrAbort(this, object_klass->IsObjectClass(),
-                    "Failed to find Object class in quickened invoke receiver",
-                    work_insn_idx_)) {
+                    "Failed to find Object class in quickened invoke receiver", work_insn_idx_)) {
       return nullptr;
     }
     dispatch_class = object_klass;
   } else {
     dispatch_class = klass;
   }
-  if (FailOrAbort(this, dispatch_class->HasVTable(),
-                  "Receiver class has no vtable for quickened invoke at ",
-                  work_insn_idx_)) {
+  if (!dispatch_class->HasVTable()) {
+    FailOrAbort(this, allow_failure, "Receiver class has no vtable for quickened invoke at ",
+                work_insn_idx_);
     return nullptr;
   }
   uint16_t vtable_index = is_range ? inst->VRegB_3rc() : inst->VRegB_35c();
-  if (FailOrAbort(this, static_cast<int32_t>(vtable_index) < dispatch_class->GetVTableLength(),
-                  "Receiver class has not enough vtable slots for quickened invoke at ",
-                  work_insn_idx_)) {
+  if (static_cast<int32_t>(vtable_index) >= dispatch_class->GetVTableLength()) {
+    FailOrAbort(this, allow_failure,
+                "Receiver class has not enough vtable slots for quickened invoke at ",
+                work_insn_idx_);
     return nullptr;
   }
   mirror::ArtMethod* res_method = dispatch_class->GetVTableEntry(vtable_index);
-  if (FailOrAbort(this, !Thread::Current()->IsExceptionPending(),
-                  "Unexpected exception pending for quickened invoke at ",
-                  work_insn_idx_)) {
+  if (Thread::Current()->IsExceptionPending()) {
+    FailOrAbort(this, allow_failure, "Unexpected exception pending for quickened invoke at ",
+                work_insn_idx_);
     return nullptr;
   }
   return res_method;
@@ -3421,9 +3434,10 @@ mirror::ArtMethod* MethodVerifier::GetQuickInvokedMethod(const Instruction* inst
 
 mirror::ArtMethod* MethodVerifier::VerifyInvokeVirtualQuickArgs(const Instruction* inst,
                                                                 bool is_range) {
-  DCHECK(Runtime::Current()->IsStarted() || verify_to_dump_);
-  mirror::ArtMethod* res_method = GetQuickInvokedMethod(inst, work_line_.get(),
-                                                             is_range);
+  DCHECK(Runtime::Current()->IsStarted() || verify_to_dump_)
+      << PrettyMethod(dex_method_idx_, *dex_file_, true) << "@" << work_insn_idx_;
+
+  mirror::ArtMethod* res_method = GetQuickInvokedMethod(inst, work_line_.get(), is_range, false);
   if (res_method == nullptr) {
     if (((method_access_flags_ & kAccConstructor) != 0) && ((method_access_flags_ & kAccStatic) != 0)) {
       // Class initializers are never compiled, but always interpreted.
@@ -3913,7 +3927,8 @@ mirror::ArtField* MethodVerifier::GetQuickFieldAccess(const Instruction* inst,
          inst->Opcode() == Instruction::IPUT_QUICK ||
          inst->Opcode() == Instruction::IPUT_WIDE_QUICK ||
          inst->Opcode() == Instruction::IPUT_OBJECT_QUICK);
-  RegType& object_type = reg_line->GetRegisterType(inst->VRegB_22c());
+  auto obj_reg = inst->VRegB_22c();
+  RegType& object_type = FallbackToDebugInfo(reg_line->GetRegisterType(obj_reg), reg_line, obj_reg);
   if (!object_type.HasClass()) {
     VLOG(verifier) << "Failed to get mirror::Class* from '" << object_type << "'";
     return nullptr;

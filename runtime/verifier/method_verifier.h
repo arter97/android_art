@@ -238,6 +238,14 @@ class MethodVerifier {
   bool HasFailures() const;
   RegType& ResolveCheckedClass(uint32_t class_idx)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // Returns the method of a quick invoke or nullptr if it cannot be found.
+  mirror::ArtMethod* GetQuickInvokedMethod(const Instruction* inst, RegisterLine* reg_line,
+                                           bool is_range, bool allow_failure)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // Returns the access field of a quick field access (iget/iput-quick) or nullptr
+  // if it cannot be found.
+  mirror::ArtField* GetQuickFieldAccess(const Instruction* inst, RegisterLine* reg_line)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
   // Private constructor for dumping.
@@ -516,11 +524,6 @@ class MethodVerifier {
                            bool is_primitive, bool is_static)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Returns the access field of a quick field access (iget/iput-quick) or nullptr
-  // if it cannot be found.
-  mirror::ArtField* GetQuickFieldAccess(const Instruction* inst, RegisterLine* reg_line)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
   template <FieldAccessType kAccType>
   void VerifyQuickFieldAccess(const Instruction* inst, RegType& insn_type, bool is_primitive)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -583,11 +586,6 @@ class MethodVerifier {
   mirror::ArtMethod* VerifyInvocationArgsFromIterator(T* it, const Instruction* inst,
                                                       MethodType method_type, bool is_range,
                                                       mirror::ArtMethod* res_method)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  mirror::ArtMethod* GetQuickInvokedMethod(const Instruction* inst,
-                                           RegisterLine* reg_line,
-                                           bool is_range)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::ArtMethod* VerifyInvokeVirtualQuickArgs(const Instruction* inst, bool is_range)

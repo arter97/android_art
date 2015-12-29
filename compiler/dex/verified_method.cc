@@ -49,7 +49,6 @@ const VerifiedMethod* VerifiedMethod::Create(verifier::MethodVerifier* method_ve
   if (compile) {
     /* Generate a register map. */
     if (!verified_method->GenerateGcMap(method_verifier)) {
-      CHECK(method_verifier->HasFailures());
       return nullptr;  // Not a real failure, but a failure to encode.
     }
     if (kIsDebugBuild) {
@@ -59,6 +58,10 @@ const VerifiedMethod* VerifiedMethod::Create(verifier::MethodVerifier* method_ve
     // TODO: move this out when DEX-to-DEX supports devirtualization.
     if (method_verifier->HasVirtualOrInterfaceInvokes()) {
       verified_method->GenerateDevirtMap(method_verifier);
+    }
+
+    if (!verified_method->GenerateDequickenMap(method_verifier)) {
+      return nullptr;
     }
   }
 
@@ -73,6 +76,11 @@ const MethodReference* VerifiedMethod::GetDevirtTarget(uint32_t dex_pc) const {
   return (it != devirt_map_.end()) ? &it->second : nullptr;
 }
 
+const DexFileReference* VerifiedMethod::GetDequickenIndex(uint32_t dex_pc) const {
+  auto it = dequicken_map_.find(dex_pc);
+  return (it != dequicken_map_.end()) ? &it->second : nullptr;
+}
+
 bool VerifiedMethod::IsSafeCast(uint32_t pc) const {
   return std::binary_search(safe_cast_set_.begin(), safe_cast_set_.end(), pc);
 }
@@ -82,33 +90,33 @@ bool VerifiedMethod::GenerateGcMap(verifier::MethodVerifier* method_verifier) {
   size_t num_entries, ref_bitmap_bits, pc_bits;
   ComputeGcMapSizes(method_verifier, &num_entries, &ref_bitmap_bits, &pc_bits);
   // There's a single byte to encode the size of each bitmap.
-  if (ref_bitmap_bits >= (8 /* bits per byte */ * 8192 /* 13-bit size */ )) {
-    // TODO: either a better GC map format or per method failures
-    method_verifier->Fail(verifier::VERIFY_ERROR_BAD_CLASS_HARD)
-        << "Cannot encode GC map for method with " << ref_bitmap_bits << " registers";
+  if (ref_bitmap_bits >= (kBitsPerByte /* bits per byte */ * 8192 /* 13-bit size */ )) {
+    LOG(WARNING) << "Cannot encode GC map for method with " << ref_bitmap_bits << " registers: "
+                 << PrettyMethod(method_verifier->GetMethodReference().dex_method_index,
+                                 *method_verifier->GetMethodReference().dex_file);
     return false;
   }
-  size_t ref_bitmap_bytes = (ref_bitmap_bits + 7) / 8;
+  size_t ref_bitmap_bytes = RoundUp(ref_bitmap_bits, kBitsPerByte) / kBitsPerByte;
   // There are 2 bytes to encode the number of entries.
   if (num_entries >= 65536) {
-    // TODO: Either a better GC map format or per method failures.
-    method_verifier->Fail(verifier::VERIFY_ERROR_BAD_CLASS_HARD)
-        << "Cannot encode GC map for method with " << num_entries << " entries";
+    LOG(WARNING) << "Cannot encode GC map for method with " << num_entries << " entries: "
+                 << PrettyMethod(method_verifier->GetMethodReference().dex_method_index,
+                                 *method_verifier->GetMethodReference().dex_file);
     return false;
   }
   size_t pc_bytes;
   verifier::RegisterMapFormat format;
-  if (pc_bits <= 8) {
+  if (pc_bits <= kBitsPerByte) {
     format = verifier::kRegMapFormatCompact8;
     pc_bytes = 1;
-  } else if (pc_bits <= 16) {
+  } else if (pc_bits <= kBitsPerByte * 2) {
     format = verifier::kRegMapFormatCompact16;
     pc_bytes = 2;
   } else {
-    // TODO: Either a better GC map format or per method failures.
-    method_verifier->Fail(verifier::VERIFY_ERROR_BAD_CLASS_HARD)
-        << "Cannot encode GC map for method with "
-        << (1 << pc_bits) << " instructions (number is rounded up to nearest power of 2)";
+    LOG(WARNING) << "Cannot encode GC map for method with "
+                 << (1 << pc_bits) << " instructions (number is rounded up to nearest power of 2): "
+                 << PrettyMethod(method_verifier->GetMethodReference().dex_method_index,
+                                 *method_verifier->GetMethodReference().dex_file);
     return false;
   }
   size_t table_size = ((pc_bytes + ref_bitmap_bytes) * num_entries) + 4;
@@ -152,16 +160,16 @@ void VerifiedMethod::VerifyGcMap(verifier::MethodVerifier* method_verifier,
       verifier::RegisterLine* line = method_verifier->GetRegLine(i);
       for (size_t j = 0; j < code_item->registers_size_; j++) {
         if (line->GetRegisterType(j).IsNonZeroReferenceTypes()) {
-          DCHECK_LT(j / 8, map.RegWidth());
-          DCHECK_EQ((reg_bitmap[j / 8] >> (j % 8)) & 1, 1);
-        } else if ((j / 8) < map.RegWidth()) {
-          DCHECK_EQ((reg_bitmap[j / 8] >> (j % 8)) & 1, 0);
+          DCHECK_LT(j / kBitsPerByte, map.RegWidth());
+          DCHECK_EQ((reg_bitmap[j / kBitsPerByte] >> (j % kBitsPerByte)) & 1, 1);
+        } else if ((j / kBitsPerByte) < map.RegWidth()) {
+          DCHECK_EQ((reg_bitmap[j / kBitsPerByte] >> (j % kBitsPerByte)) & 1, 0);
         } else {
           // If a register doesn't contain a reference then the bitmap may be shorter than the line.
         }
       }
     } else {
-      DCHECK(reg_bitmap == NULL);
+      DCHECK(i >= 65536 || reg_bitmap == NULL);
     }
   }
 }
@@ -190,6 +198,51 @@ void VerifiedMethod::ComputeGcMapSizes(verifier::MethodVerifier* method_verifier
   *log2_max_gc_pc = i;
 }
 
+bool VerifiedMethod::GenerateDequickenMap(verifier::MethodVerifier* method_verifier) {
+  if (method_verifier->HasFailures()) {
+    return false;
+  }
+  const DexFile::CodeItem* code_item = method_verifier->CodeItem();
+  const uint16_t* insns = code_item->insns_;
+  const Instruction* inst = Instruction::At(insns);
+  const Instruction* end = Instruction::At(insns + code_item->insns_size_in_code_units_);
+  for (; inst < end; inst = inst->Next()) {
+    const bool is_virtual_quick = inst->Opcode() == Instruction::INVOKE_VIRTUAL_QUICK;
+    const bool is_range_quick = inst->Opcode() == Instruction::INVOKE_VIRTUAL_RANGE_QUICK;
+    const bool is_iget_or_iput_quick = inst->Opcode() >= Instruction::IGET_QUICK &&
+                                       inst->Opcode() <= Instruction::IPUT_OBJECT_QUICK;
+    if (is_virtual_quick || is_range_quick) {
+      uint32_t dex_pc = inst->GetDexPc(insns);
+      verifier::RegisterLine* line = method_verifier->GetRegLine(dex_pc);
+      mirror::ArtMethod* method =
+          method_verifier->GetQuickInvokedMethod(inst, line, is_range_quick, true);
+      if (method == nullptr) {
+        // It can be null if the line wasn't verified since it was unreachable.
+        return false;
+      }
+      // The verifier must know what the type of the object was or else we would have gotten a
+      // failure. Put the dex method index in the dequicken map since we need this to get number of
+      // arguments in the compiler.
+      dequicken_map_.Put(dex_pc, DexFileReference(method->GetDexFile(),
+                                                  method->GetDexMethodIndex()));
+    } else if (is_iget_or_iput_quick) {
+      uint32_t dex_pc = inst->GetDexPc(insns);
+      verifier::RegisterLine* line = method_verifier->GetRegLine(dex_pc);
+      mirror::ArtField* field = method_verifier->GetQuickFieldAccess(inst, line);
+      if (field == nullptr) {
+        // It can be null if the line wasn't verified since it was unreachable.
+        return false;
+      }
+      // The verifier must know what the type of the field was or else we would have gotten a
+      // failure. Put the dex field index in the dequicken map since we need this for lowering
+      // in the compiler.
+      // TODO: Putting a field index in a method reference is gross.
+      dequicken_map_.Put(dex_pc, DexFileReference(field->GetDexFile(), field->GetDexFieldIndex()));
+    }
+  }
+  return true;
+}
+
 void VerifiedMethod::GenerateDevirtMap(verifier::MethodVerifier* method_verifier) {
   // It is risky to rely on reg_types for sharpening in cases of soft
   // verification, we might end up sharpening to a wrong implementation. Just abort.
@@ -203,10 +256,10 @@ void VerifiedMethod::GenerateDevirtMap(verifier::MethodVerifier* method_verifier
   const Instruction* end = Instruction::At(insns + code_item->insns_size_in_code_units_);
 
   for (; inst < end; inst = inst->Next()) {
-    bool is_virtual   = (inst->Opcode() == Instruction::INVOKE_VIRTUAL) ||
-        (inst->Opcode() ==  Instruction::INVOKE_VIRTUAL_RANGE);
-    bool is_interface = (inst->Opcode() == Instruction::INVOKE_INTERFACE) ||
-        (inst->Opcode() == Instruction::INVOKE_INTERFACE_RANGE);
+    const bool is_virtual = inst->Opcode() == Instruction::INVOKE_VIRTUAL ||
+        inst->Opcode() == Instruction::INVOKE_VIRTUAL_RANGE;
+    const bool is_interface = inst->Opcode() == Instruction::INVOKE_INTERFACE ||
+        inst->Opcode() == Instruction::INVOKE_INTERFACE_RANGE;
 
     if (!is_interface && !is_virtual) {
       continue;
@@ -214,8 +267,8 @@ void VerifiedMethod::GenerateDevirtMap(verifier::MethodVerifier* method_verifier
     // Get reg type for register holding the reference to the object that will be dispatched upon.
     uint32_t dex_pc = inst->GetDexPc(insns);
     verifier::RegisterLine* line = method_verifier->GetRegLine(dex_pc);
-    bool is_range = (inst->Opcode() ==  Instruction::INVOKE_VIRTUAL_RANGE) ||
-        (inst->Opcode() ==  Instruction::INVOKE_INTERFACE_RANGE);
+    const bool is_range = inst->Opcode() ==  Instruction::INVOKE_VIRTUAL_RANGE ||
+        inst->Opcode() == Instruction::INVOKE_INTERFACE_RANGE;
     verifier::RegType&
         reg_type(line->GetRegisterType(is_range ? inst->VRegC_3rc() : inst->VRegC_35c()));
 
@@ -240,14 +293,14 @@ void VerifiedMethod::GenerateDevirtMap(verifier::MethodVerifier* method_verifier
       continue;
     }
     // Find the concrete method.
-    mirror::ArtMethod* concrete_method = NULL;
+    mirror::ArtMethod* concrete_method = nullptr;
     if (is_interface) {
       concrete_method = reg_type.GetClass()->FindVirtualMethodForInterface(abstract_method);
     }
     if (is_virtual) {
       concrete_method = reg_type.GetClass()->FindVirtualMethodForVirtual(abstract_method);
     }
-    if (concrete_method == NULL || concrete_method->IsAbstract()) {
+    if (concrete_method == nullptr || concrete_method->IsAbstract()) {
       // In cases where concrete_method is not found, or is abstract, continue to the next invoke.
       continue;
     }
@@ -255,10 +308,7 @@ void VerifiedMethod::GenerateDevirtMap(verifier::MethodVerifier* method_verifier
         concrete_method->GetDeclaringClass()->IsFinal()) {
       // If we knew exactly the class being dispatched upon, or if the target method cannot be
       // overridden record the target to be used in the compiler driver.
-      MethodReference concrete_ref(
-          concrete_method->GetDeclaringClass()->GetDexCache()->GetDexFile(),
-          concrete_method->GetDexMethodIndex());
-      devirt_map_.Put(dex_pc, concrete_ref);
+      devirt_map_.Put(dex_pc, concrete_method->ToMethodReference());
     }
   }
 }
