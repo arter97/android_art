@@ -228,6 +228,9 @@ static void Usage(const char* fmt, ...) {
   UsageError("  --disable-passes=<pass-names>:  disable one or more passes separated by comma.");
   UsageError("      Example: --disable-passes=UseCount,BBOptimizations");
   UsageError("");
+  UsageError("  --swap-fd=<file-descriptor>:  specifies a file to use for swap (by descriptor).");
+  UsageError("      Example: --swap-fd=10");
+  UsageError("");
   std::cerr << "See log for usage error information\n";
   exit(EXIT_FAILURE);
 }
@@ -821,6 +824,25 @@ void ParseDouble(const std::string& option, char after_char,
   *parsed_value = value;
 }
 
+static constexpr size_t kMinDexFilesForSwap = 2;
+static constexpr size_t kMinDexFileCumulativeSizeForSwap = 20 * MB;
+
+static bool UseSwap(bool is_image, std::vector<const DexFile*>& dex_files) {
+  if (is_image) {
+    // Don't use swap, we know generation should succeed, and we don't want to slow it down.
+    return false;
+  }
+  if (dex_files.size() < kMinDexFilesForSwap) {
+    // If there are less dex files than the threshold, assume it's gonna be fine.
+    return false;
+  }
+  size_t dex_files_size = 0;
+  for (const auto* dex_file : dex_files) {
+    dex_files_size += dex_file->GetHeader().file_size_;
+  }
+  return dex_files_size >= kMinDexFileCumulativeSizeForSwap;
+}
+
 static int dex2oat(int argc, char** argv) {
 #if defined(__linux__) && defined(__arm__)
   int major, minor;
@@ -908,6 +930,9 @@ static int dex2oat(int argc, char** argv) {
   bool implicit_null_checks = false;
   bool implicit_so_checks = false;
   bool implicit_suspend_checks = false;
+
+  // Swap file.
+  int swap_fd = -1;  // No swap file descriptor;
 
   for (int i = 0; i < argc; i++) {
     const StringPiece option(argv[i]);
@@ -1089,6 +1114,14 @@ static int dex2oat(int argc, char** argv) {
       include_patch_information = true;
     } else if (option == "--no-include-patch-information") {
       include_patch_information = false;
+    } else if (option.starts_with("--swap-fd=")) {
+      const char* swap_fd_str = option.substr(strlen("--swap-fd=")).data();
+      if (!ParseInt(swap_fd_str, &swap_fd)) {
+        Usage("Failed to parse --swap-fd argument '%s' as an integer", swap_fd_str);
+      }
+      if (swap_fd < 0) {
+        Usage("--swap-fd passed a negative value %d", swap_fd);
+      }
     } else {
       LOG(WARNING) << StringPrintf("Unknown argument %s", option.data());
     }
@@ -1289,6 +1322,11 @@ static int dex2oat(int argc, char** argv) {
       std::make_pair("imageinstructionset",
                      reinterpret_cast<const void*>(GetInstructionSetString(instruction_set))));
 
+  if (swap_fd != -1) {
+    // Swap file indicates low-memory mode. Use GC.
+    runtime_options.push_back(std::make_pair("-Xgc:MS", nullptr));
+  }
+
   Dex2Oat* p_dex2oat;
   if (!Dex2Oat::Create(&p_dex2oat,
                        runtime_options,
@@ -1402,6 +1440,16 @@ static int dex2oat(int argc, char** argv) {
   for (const auto& dex_file : dex_files) {
     if (!is_recompiling && !dex_file->EnableWrite()) {
       PLOG(ERROR) << "Failed to make .dex file writeable '" << dex_file->GetLocation() << "'\n";
+    }
+  }
+  // If we use a swap file, ensure we are above the threshold to make it necessary.
+  if (swap_fd != -1) {
+    if (!UseSwap(image, dex_files)) {
+      close(swap_fd);
+      swap_fd = -1;
+      LOG(INFO) << "Decided to run without swap.";
+    } else {
+      LOG(INFO) << "Accepted running with swap.";
     }
   }
 
