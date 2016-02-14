@@ -66,6 +66,9 @@
 #include "well_known_classes.h"
 #include "zip_archive.h"
 #include "zlib.h"
+#include "xz_config.h"
+#include "xz.h"
+#include "xz_private.h"
 
 namespace art {
 
@@ -616,6 +619,115 @@ static File* Inflate(const std::string& filename, int out_fd, std::string* err) 
   return out_file.release();
 }
 
+static File* InflateXZ(const std::string& filename, int out_fd, std::string* err) {
+
+  if (out_fd == -1) {
+  *err = "No swap file available";
+  return nullptr;
+  }
+
+  struct xz_buf b;
+  struct xz_dec *dec;
+  uint8_t xz_out[BUFSIZ];
+  enum xz_ret ret;
+  std::string uncompressed;
+
+  std::ifstream t(filename.c_str());
+  std::ostringstream in_contents;
+  in_contents << t.rdbuf();
+  std::string input_str = in_contents.str();
+
+  b.in = (const uint8_t*) input_str.c_str();
+  b.in_pos = 0;
+  b.in_size = input_str.length();
+  b.out = xz_out;
+  b.out_pos = 0;
+  b.out_size = BUFSIZ;
+
+  xz_crc32_init();
+
+  xz_crc64_init();
+
+  dec = xz_dec_init(XZ_DYNALLOC, 1 << 26);
+  if(dec == NULL) {
+     LOG(WARNING) << "xz_dec_init FAILED!";
+     return nullptr;
+  }
+
+  while (b.in_pos != b.in_size) {
+     ret = xz_dec_run(dec, &b);
+     uncompressed.append((const char*) xz_out, b.out_pos);
+     b.out_pos = 0;
+
+     if (ret == XZ_OK)
+       continue;
+
+     if (ret == XZ_STREAM_END) {
+
+       xz_dec_end(dec);
+
+       std::unique_ptr<File> out_file_ptr(new File(out_fd, false));
+
+       if (!out_file_ptr->WriteFully(uncompressed.c_str(), uncompressed.length())) {
+         *err = StringPrintf("Could not write to fd=%d", out_fd);
+         return nullptr;
+       }
+
+       if (out_file_ptr->Flush() != 0) {
+         *err = StringPrintf("Could not flush swap file fd=%d", out_fd);
+         return nullptr;
+       }
+
+       out_file_ptr->DisableAutoClose();
+       return out_file_ptr.release();
+     }
+
+     if (ret == XZ_UNSUPPORTED_CHECK) {
+       LOG(WARNING) << "Unsupported check; not verifying file integrity";
+       continue;
+     }
+
+     if (ret == XZ_MEM_ERROR) {
+       LOG(ERROR) << "Memory allocation failed";
+       break;
+     }
+
+     if (ret == XZ_MEMLIMIT_ERROR) {
+       LOG(ERROR) << "Memory usage limit reached";
+       break;
+     }
+
+     if (ret == XZ_FORMAT_ERROR) {
+       LOG(ERROR) << "XZ file format error";
+       break;
+     }
+
+     if (ret == XZ_OPTIONS_ERROR) {
+       LOG(ERROR) << "Unsupported options in the .xz headers";
+       break;
+     }
+
+     if (ret == XZ_DATA_ERROR) {
+       LOG(ERROR) << "File data corrupt";
+       break;
+     }
+
+     if (ret == XZ_BUF_ERROR) {
+       LOG(ERROR) << "File buffer corrupt";
+       break;
+     } else {
+       LOG(ERROR) << "XZ Bug!";
+       break;
+     }
+
+  }
+
+  *err = StringPrintf("Could not uncompress file=%s", filename.c_str());
+  xz_dec_end(dec);
+  return nullptr;
+
+}
+
 static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
                            const std::vector<const char*>& dex_locations,
                            std::vector<const DexFile*>& dex_files,
@@ -640,6 +752,14 @@ static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
       }
     } else if (EndsWith(dex_filename, ".gz.xposed")) {
       file.reset(Inflate(dex_filename, swap_fd, &error_msg));
+      if (file.get() == nullptr) {
+        LOG(WARNING) << "Failed to inflate " << dex_filename << "': " << error_msg;
+        ++failure_count;
+        continue;
+      }
+      swap_fd = -1;
+    } else if (EndsWith(dex_filename, ".xz.xposed")) {
+      file.reset(InflateXZ(dex_filename, swap_fd, &error_msg));
       if (file.get() == nullptr) {
         LOG(WARNING) << "Failed to inflate " << dex_filename << "': " << error_msg;
         ++failure_count;

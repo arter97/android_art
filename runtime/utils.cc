@@ -1403,9 +1403,14 @@ std::string GetRenamedOdexFileName(std::string odex_filename) {
   if (OS::FileExists(filename.c_str())) {
     return filename;
   } else {
-    filename = odex_filename + ".xposed";
+    filename = odex_filename + ".xz.xposed";
     if (OS::FileExists(filename.c_str())) {
       return filename;
+    } else {
+      filename = odex_filename + ".xposed";
+      if (OS::FileExists(filename.c_str())) {
+        return filename;
+      }
     }
   }
 
