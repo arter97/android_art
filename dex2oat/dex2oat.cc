@@ -585,7 +585,7 @@ static File* Inflate(const std::string& filename, int out_fd, std::string* err) 
   }
 
   constexpr size_t INFLATE_BUFLEN = 16384;
-  std::unique_ptr<File> out_file(new File(out_fd, false));
+  std::unique_ptr<File> out_file(new File(out_fd));
   std::unique_ptr<Byte[]> buf(new Byte[INFLATE_BUFLEN]);
   int len;
 
@@ -666,7 +666,7 @@ static File* InflateXZ(const std::string& filename, int out_fd, std::string* err
 
        xz_dec_end(dec);
 
-       std::unique_ptr<File> out_file_ptr(new File(out_fd, false));
+       std::unique_ptr<File> out_file_ptr(new File(out_fd));
 
        if (!out_file_ptr->WriteFully(uncompressed.c_str(), uncompressed.length())) {
          *err = StringPrintf("Could not write to fd=%d", out_fd);
