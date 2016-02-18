@@ -65,6 +65,10 @@
 #include "vector_output_stream.h"
 #include "well_known_classes.h"
 #include "zip_archive.h"
+#include "zlib.h"
+#include "xz_config.h"
+#include "xz.h"
+#include "xz_private.h"
 
 namespace art {
 
@@ -227,6 +231,9 @@ static void Usage(const char* fmt, ...) {
   UsageError("");
   UsageError("  --disable-passes=<pass-names>:  disable one or more passes separated by comma.");
   UsageError("      Example: --disable-passes=UseCount,BBOptimizations");
+  UsageError("");
+  UsageError("  --swap-fd=<file-descriptor>:  specifies a file to use for swap (by descriptor).");
+  UsageError("      Example: --swap-fd=10");
   UsageError("");
   std::cerr << "See log for usage error information\n";
   exit(EXIT_FAILURE);
@@ -565,9 +572,166 @@ class Dex2Oat {
   DISALLOW_IMPLICIT_CONSTRUCTORS(Dex2Oat);
 };
 
+static File* Inflate(const std::string& filename, int out_fd, std::string* err) {
+  if (out_fd == -1) {
+    *err = "No swap file available";
+    return nullptr;
+  }
+
+  gzFile in_gzfile = gzopen(filename.c_str(), "rb");
+  if (in_gzfile == nullptr) {
+    *err = StringPrintf("Could not open gzip file: %s", strerror(errno));
+    return nullptr;
+  }
+
+  constexpr size_t INFLATE_BUFLEN = 16384;
+  std::unique_ptr<File> out_file(new File(out_fd));
+  std::unique_ptr<Byte[]> buf(new Byte[INFLATE_BUFLEN]);
+  int len;
+
+  while (0 < (len = gzread(in_gzfile, buf.get(), INFLATE_BUFLEN)))  {
+    if (!out_file->WriteFully(buf.get(), len)) {
+      *err = StringPrintf("Could not write to fd=%d: %s", out_fd, out_file->GetPath().c_str());
+      gzclose(in_gzfile);
+      return nullptr;
+    }
+  }
+
+  int errnum;
+  const char* gzerrstr = gzerror(in_gzfile, &errnum);
+
+  if (len < 0 || errnum != Z_OK) {
+    *err = StringPrintf("Could not inflate gzip file: %s", gzerrstr);
+    gzclose(in_gzfile);
+    return nullptr;
+  }
+
+  if ((errnum = gzclose(in_gzfile)) != Z_OK) {
+    *err = StringPrintf("Could not close gzip file: gzclose() returned %d", errnum);
+  }
+
+  if (out_file->Flush() != 0) {
+    *err = StringPrintf("Could not flush swap file fd=%d", out_fd);
+    return nullptr;
+  }
+
+  out_file->DisableAutoClose();
+  return out_file.release();
+}
+
+static File* InflateXZ(const std::string& filename, int out_fd, std::string* err) {
+
+  if (out_fd == -1) {
+  *err = "No swap file available";
+  return nullptr;
+  }
+
+  struct xz_buf b;
+  struct xz_dec *dec;
+  uint8_t xz_out[BUFSIZ];
+  enum xz_ret ret;
+  std::string uncompressed;
+
+  std::ifstream t(filename.c_str());
+  std::ostringstream in_contents;
+  in_contents << t.rdbuf();
+  std::string input_str = in_contents.str();
+
+  b.in = (const uint8_t*) input_str.c_str();
+  b.in_pos = 0;
+  b.in_size = input_str.length();
+  b.out = xz_out;
+  b.out_pos = 0;
+  b.out_size = BUFSIZ;
+
+  xz_crc32_init();
+
+  xz_crc64_init();
+
+  dec = xz_dec_init(XZ_DYNALLOC, 1 << 26);
+  if(dec == NULL) {
+     LOG(WARNING) << "xz_dec_init FAILED!";
+     return nullptr;
+  }
+
+  while (b.in_pos != b.in_size) {
+     ret = xz_dec_run(dec, &b);
+     uncompressed.append((const char*) xz_out, b.out_pos);
+     b.out_pos = 0;
+
+     if (ret == XZ_OK)
+       continue;
+
+     if (ret == XZ_STREAM_END) {
+
+       xz_dec_end(dec);
+
+       std::unique_ptr<File> out_file_ptr(new File(out_fd));
+
+       if (!out_file_ptr->WriteFully(uncompressed.c_str(), uncompressed.length())) {
+         *err = StringPrintf("Could not write to fd=%d", out_fd);
+         return nullptr;
+       }
+
+       if (out_file_ptr->Flush() != 0) {
+         *err = StringPrintf("Could not flush swap file fd=%d", out_fd);
+         return nullptr;
+       }
+
+       out_file_ptr->DisableAutoClose();
+       return out_file_ptr.release();
+     }
+
+     if (ret == XZ_UNSUPPORTED_CHECK) {
+       LOG(WARNING) << "Unsupported check; not verifying file integrity";
+       continue;
+     }
+
+     if (ret == XZ_MEM_ERROR) {
+       LOG(ERROR) << "Memory allocation failed";
+       break;
+     }
+
+     if (ret == XZ_MEMLIMIT_ERROR) {
+       LOG(ERROR) << "Memory usage limit reached";
+       break;
+     }
+
+     if (ret == XZ_FORMAT_ERROR) {
+       LOG(ERROR) << "XZ file format error";
+       break;
+     }
+
+     if (ret == XZ_OPTIONS_ERROR) {
+       LOG(ERROR) << "Unsupported options in the .xz headers";
+       break;
+     }
+
+     if (ret == XZ_DATA_ERROR) {
+       LOG(ERROR) << "File data corrupt";
+       break;
+     }
+
+     if (ret == XZ_BUF_ERROR) {
+       LOG(ERROR) << "File buffer corrupt";
+       break;
+     } else {
+       LOG(ERROR) << "XZ Bug!";
+       break;
+     }
+
+  }
+
+  *err = StringPrintf("Could not uncompress file=%s", filename.c_str());
+  xz_dec_end(dec);
+  return nullptr;
+
+}
+
 static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
                            const std::vector<const char*>& dex_locations,
-                           std::vector<const DexFile*>& dex_files) {
+                           std::vector<const DexFile*>& dex_files,
+                           int& swap_fd) {
   size_t failure_count = 0;
   for (size_t i = 0; i < dex_filenames.size(); i++) {
     const char* dex_filename = dex_filenames[i];
@@ -578,13 +742,32 @@ static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
       LOG(WARNING) << "Skipping non-existent dex file '" << dex_filename << "'";
       continue;
     }
+    std::unique_ptr<File> file;
     if (EndsWith(dex_filename, ".oat") || EndsWith(dex_filename, ".odex") || EndsWith(dex_filename, ".odex.xposed")) {
-      std::unique_ptr<File> file(OS::OpenFileForReading(dex_filename));
+      file.reset(OS::OpenFileForReading(dex_filename));
       if (file.get() == nullptr) {
-        LOG(WARNING) << "Failed to open file '" << dex_filename << "': " << strerror(errno);;
+        LOG(WARNING) << "Failed to open file '" << dex_filename << "': " << strerror(errno);
         ++failure_count;
         continue;
       }
+    } else if (EndsWith(dex_filename, ".gz.xposed")) {
+      file.reset(Inflate(dex_filename, swap_fd, &error_msg));
+      if (file.get() == nullptr) {
+        LOG(WARNING) << "Failed to inflate " << dex_filename << "': " << error_msg;
+        ++failure_count;
+        continue;
+      }
+      swap_fd = -1;
+    } else if (EndsWith(dex_filename, ".xz.xposed")) {
+      file.reset(InflateXZ(dex_filename, swap_fd, &error_msg));
+      if (file.get() == nullptr) {
+        LOG(WARNING) << "Failed to inflate " << dex_filename << "': " << error_msg;
+        ++failure_count;
+        continue;
+      }
+      swap_fd = -1;
+    }
+    if (file.get() != nullptr) {
       std::unique_ptr<ElfFile> elf_file(ElfFile::Open(file.release(), PROT_READ | PROT_WRITE, MAP_PRIVATE, &error_msg));
       if (elf_file.get() == nullptr) {
         LOG(WARNING) << "Failed to open ELF file from '" << dex_filename << "': " << error_msg;
@@ -821,6 +1004,25 @@ void ParseDouble(const std::string& option, char after_char,
   *parsed_value = value;
 }
 
+static constexpr size_t kMinDexFilesForSwap = 2;
+static constexpr size_t kMinDexFileCumulativeSizeForSwap = 20 * MB;
+
+static bool UseSwap(bool is_image, std::vector<const DexFile*>& dex_files) {
+  if (is_image) {
+    // Don't use swap, we know generation should succeed, and we don't want to slow it down.
+    return false;
+  }
+  if (dex_files.size() < kMinDexFilesForSwap) {
+    // If there are less dex files than the threshold, assume it's gonna be fine.
+    return false;
+  }
+  size_t dex_files_size = 0;
+  for (const auto* dex_file : dex_files) {
+    dex_files_size += dex_file->GetHeader().file_size_;
+  }
+  return dex_files_size >= kMinDexFileCumulativeSizeForSwap;
+}
+
 static int dex2oat(int argc, char** argv) {
 #if defined(__linux__) && defined(__arm__)
   int major, minor;
@@ -908,6 +1110,9 @@ static int dex2oat(int argc, char** argv) {
   bool implicit_null_checks = false;
   bool implicit_so_checks = false;
   bool implicit_suspend_checks = false;
+
+  // Swap file.
+  int swap_fd = -1;  // No swap file descriptor;
 
   for (int i = 0; i < argc; i++) {
     const StringPiece option(argv[i]);
@@ -1089,6 +1294,14 @@ static int dex2oat(int argc, char** argv) {
       include_patch_information = true;
     } else if (option == "--no-include-patch-information") {
       include_patch_information = false;
+    } else if (option.starts_with("--swap-fd=")) {
+      const char* swap_fd_str = option.substr(strlen("--swap-fd=")).data();
+      if (!ParseInt(swap_fd_str, &swap_fd)) {
+        Usage("Failed to parse --swap-fd argument '%s' as an integer", swap_fd_str);
+      }
+      if (swap_fd < 0) {
+        Usage("--swap-fd passed a negative value %d", swap_fd);
+      }
     } else {
       LOG(WARNING) << StringPrintf("Unknown argument %s", option.data());
     }
@@ -1267,7 +1480,7 @@ static int dex2oat(int argc, char** argv) {
   std::vector<const DexFile*> boot_class_path;
   art::MemMap::Init();  // For ZipEntry::ExtractToMemMap.
   if (boot_image_option.empty()) {
-    size_t failure_count = OpenDexFiles(dex_filenames, dex_locations, boot_class_path);
+    size_t failure_count = OpenDexFiles(dex_filenames, dex_locations, boot_class_path, swap_fd);
     if (failure_count > 0) {
       LOG(ERROR) << "Failed to open some dex files: " << failure_count;
       return EXIT_FAILURE;
@@ -1288,6 +1501,11 @@ static int dex2oat(int argc, char** argv) {
   runtime_options.push_back(
       std::make_pair("imageinstructionset",
                      reinterpret_cast<const void*>(GetInstructionSetString(instruction_set))));
+
+  if (swap_fd != -1) {
+    // Swap file indicates low-memory mode. Use GC.
+    runtime_options.push_back(std::make_pair("-Xgc:MS", nullptr));
+  }
 
   Dex2Oat* p_dex2oat;
   if (!Dex2Oat::Create(&p_dex2oat,
@@ -1372,7 +1590,7 @@ static int dex2oat(int argc, char** argv) {
       }
       ATRACE_END();
     } else {
-      size_t failure_count = OpenDexFiles(dex_filenames, dex_locations, dex_files);
+      size_t failure_count = OpenDexFiles(dex_filenames, dex_locations, dex_files, swap_fd);
       if (failure_count > 0) {
         LOG(ERROR) << "Failed to open some dex files: " << failure_count;
         return EXIT_FAILURE;
@@ -1402,6 +1620,16 @@ static int dex2oat(int argc, char** argv) {
   for (const auto& dex_file : dex_files) {
     if (!is_recompiling && !dex_file->EnableWrite()) {
       PLOG(ERROR) << "Failed to make .dex file writeable '" << dex_file->GetLocation() << "'\n";
+    }
+  }
+  // If we use a swap file, ensure we are above the threshold to make it necessary.
+  if (swap_fd != -1) {
+    if (!UseSwap(image, dex_files)) {
+      close(swap_fd);
+      swap_fd = -1;
+      LOG(INFO) << "Decided to run without swap.";
+    } else {
+      LOG(INFO) << "Accepted running with swap.";
     }
   }
 
