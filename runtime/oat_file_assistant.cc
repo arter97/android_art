@@ -188,13 +188,12 @@ std::unique_ptr<OatFile> OatFileAssistant::GetBestOatFile() {
       }
     }
 
-    if (!OdexFileIsOutOfDate()) {
-      load_executable_ = false;
-      ClearOdexFileCache();
-      if (!OdexFileIsOutOfDate()) {
-        oat_file_released_ = true;
-        return std::move(cached_odex_file_);
-      }
+    load_executable_ = false;
+    ClearOdexFileCache();
+    if (GetOdexFile() != nullptr) {
+      LOG(WARNING) << "Falling back to interpreting " << cached_odex_file_name_;
+      oat_file_released_ = true;
+      return std::move(cached_odex_file_);
     }
   }
 
@@ -447,7 +446,7 @@ bool OatFileAssistant::GivenOatFileIsOutOfDate(const OatFile& file) {
     return true;
   }
 
-  if (!file.GetOatHeader().IsXposedOatVersionValid()) {
+  if (!Runtime::Current()->IsMinimalFramework() && !file.GetOatHeader().IsXposedOatVersionValid()) {
     VLOG(oat) << "Xposed oat version is outdated";
     return true;
   }

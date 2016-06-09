@@ -572,7 +572,8 @@ void QuickCompiler::InitCompilationUnit(CompilationUnit& cu) const {
     cu.disable_opt |= 1u << kLocalValueNumbering;
   }
   if (cu.dex_file->GetOatDexFile() != nullptr) {
-    cu.disable_opt |= 1u << kGvnDeadCodeElimination;
+    cu.disable_opt |= 1u << kGlobalValueNumbering;
+    cu.disable_opt |= 1u << kLocalValueNumbering;
   }
 }
 
