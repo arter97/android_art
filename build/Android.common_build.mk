@@ -227,11 +227,11 @@ endif
 
 # Cflags for non-debug ART and ART tools.
 art_non_debug_cflags := \
-  -O3
+  -O3 -funroll-loops
 
 # Cflags for debug ART and ART tools.
 art_debug_cflags := \
-  -O3 \
+  -O3 -funroll-loops \
   -DDYNAMIC_ANNOTATIONS_ENABLED=1 \
   -DVIXL_DEBUG \
   -UNDEBUG
